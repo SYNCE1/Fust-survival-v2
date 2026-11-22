@@ -1,24 +1,911 @@
--- 1) top of the file
-local aimState, lastErr = "-", "none"
+-- Fust Survival v2: ESP + Aimbot (ballistics) + Less recoil, Rust-style menu (Luau). NOT TESTED.
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local RS = game:GetService("ReplicatedStorage")
 
--- 2) applyAim(): every aimState assignment
-aimState = "off"
-aimState = "waiting for RMB"; lockedPlr = nil; return
-if #cands == 0 then aimState = "no target"; lockedPlr = nil; return end
-if not d then aimState = "out of range (ballistic)"; return end
-aimState = string.format("locked %s (flight %.2fs)", pick.plr.Name, t)
-aimState = "locked " .. pick.plr.Name .. " (straight, ballistics UNSET)"
+if getgenv and getgenv().__FUST_RUST_UNLOAD then pcall(getgenv().__FUST_RUST_UNLOAD) end
 
--- 3) onRender()
-lastErr = "none"
-statusLabel.Text = string.format("aim: %s\ncandidates=%d firing=%s\nspeed=%s drop=%s\nerror=%s\n%s",
-	aimState, #cands, tostring(firing),
-	B.Speed and tostring(B.Speed) or "UNSET", B.Drop and tostring(B.Drop) or "UNSET",
-	lastErr, table.concat(logLines, "\n"))
+local LP = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
 
--- 4) scanValues()
-if n >= 80 then log("stopped at 80 results") return end
-log("scan done, found: " .. n)
+local Config = {
+	ESP = { Enabled = true, Corner = true, Skeleton = true, Tracer = false, HeadDot = true,
+		Name = true, Health = true, Distance = true, TeamCheck = false, MaxDistance = 1500 },
+	Aim = { Enabled = false, Part = 1, FOV = 120, Smooth = 0.25, MaxDistance = 1500,
+		SyncESPRange = true,   -- aim range follows the ESP max distance
+		VisibleOnly = true, Sticky = true, HoldRMB = false, ShowFOV = true, TeamCheck = false, ForceCenter = false },
+	-- Speed / Drop are intentionally ABSENT (= UNSET). Real values must come from the game (Scan / Measure in the BALL tab).
+	-- Speed: studs/second. Drop: downward acceleration in studs/second^2 (workspace.Gravity only if the game uses it).
+	Ballistics = { Enabled = true, Lead = true },
+	Recoil = { Enabled = false, Strength = 0.6 },   -- fraction of upward kick cancelled (uncalibrated)
+	Colors = { Visible = Color3.fromRGB(0, 255, 90), Hidden = Color3.fromRGB(255, 60, 60),
+		Text = Color3.fromRGB(255, 255, 255), FOV = Color3.fromRGB(205, 65, 43) },
+}
 
--- 5) projectile measurement
-log(string.format("projectile? %s physics=%.0f measured=%.0f st/s", inst.Name, v1, (inst.Position - p1).Magnitude / 0.1))
+local PART_DEFS = {
+	{ key = "Head",     names = { "Head" } },
+	{ key = "Torso",    names = { "UpperTorso", "Torso" } },
+	{ key = "LeftArm",  names = { "LeftUpperArm", "Left Arm" } },
+	{ key = "RightArm", names = { "RightUpperArm", "Right Arm" } },
+	{ key = "LeftLeg",  names = { "LeftUpperLeg", "Left Leg" } },
+	{ key = "RightLeg", names = { "RightUpperLeg", "Right Leg" } },
+}
+local AIM_KEYS = { "Head", "Torso", "LeftArm", "RightArm", "LeftLeg", "RightLeg" }
+local AIM_NAMES = { "Head", "Torso", "Left Arm", "Right Arm", "Left Leg", "Right Leg", "Closest" }
+
+local BONES_R15 = {
+	{ "Head", "UpperTorso" }, { "UpperTorso", "LowerTorso" },
+	{ "UpperTorso", "LeftUpperArm" }, { "LeftUpperArm", "LeftLowerArm" }, { "LeftLowerArm", "LeftHand" },
+	{ "UpperTorso", "RightUpperArm" }, { "RightUpperArm", "RightLowerArm" }, { "RightLowerArm", "RightHand" },
+	{ "LowerTorso", "LeftUpperLeg" }, { "LeftUpperLeg", "LeftLowerLeg" }, { "LeftLowerLeg", "LeftFoot" },
+	{ "LowerTorso", "RightUpperLeg" }, { "RightUpperLeg", "RightLowerLeg" }, { "RightLowerLeg", "RightFoot" },
+}
+local BONES_R6 = {
+	{ "Head", "Torso" }, { "Torso", "Left Arm" }, { "Torso", "Right Arm" },
+	{ "Torso", "Left Leg" }, { "Torso", "Right Leg" },
+}
+
+local HAS_DRAWING = (typeof(Drawing) == "table" or typeof(Drawing) == "userdata") and Drawing.new ~= nil
+local connections, entities, unloaded = {}, {}, false
+local lockedPlr, lastPitch
+local firing, toolFiring, mouseFiring, measuring = false, false, false, false
+local aimState, lastErr = "-", "yok"
+local logLines = {}
+local statusLabel
+
+local function log(msg)
+	print("[SYNCE] " .. msg)
+	table.insert(logLines, msg)
+	while #logLines > 12 do table.remove(logLines, 1) end
+end
+
+----------------------------------------------------------------- helpers
+local function newDraw(kind, props)
+	local o = Drawing.new(kind)
+	for k, v in pairs(props) do o[k] = v end
+	return o
+end
+
+local function isFinite3(v)
+	return v.X == v.X and v.Y == v.Y and v.Z == v.Z
+		and math.abs(v.X) < 1e6 and math.abs(v.Y) < 1e6 and math.abs(v.Z) < 1e6
+end
+
+local function findPart(char, names)
+	for _, n in ipairs(names) do
+		local p = char:FindFirstChild(n)
+		if p and p:IsA("BasePart") then return p end
+	end
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.RespectCanCollide = true
+
+-- Skips invisible blockers (hitboxes, invisible walls); stops at the first solid visible one.
+local function isPointVisible(origin, point, baseFilter)
+	local filter = table.clone(baseFilter)
+	for _ = 1, 6 do
+		rayParams.FilterDescendantsInstances = filter
+		local res = Workspace:Raycast(origin, point - origin, rayParams)
+		if not res then return true end
+		if res.Instance.Transparency >= 0.9 then
+			filter[#filter + 1] = res.Instance
+		else
+			return false
+		end
+	end
+	return false
+end
+
+local function accumulate(cf, size, b)
+	local h = size / 2
+	for sx = -1, 1, 2 do
+		for sy = -1, 1, 2 do
+			for sz = -1, 1, 2 do
+				local p = Camera:WorldToViewportPoint((cf * CFrame.new(h.X * sx, h.Y * sy, h.Z * sz)).Position)
+				if p.Z <= 0 then return false end
+				if p.X < b[1] then b[1] = p.X end
+				if p.Y < b[2] then b[2] = p.Y end
+				if p.X > b[3] then b[3] = p.X end
+				if p.Y > b[4] then b[4] = p.Y end
+			end
+		end
+	end
+	return true
+end
+
+local function projectBox(cf, size)
+	local b = { math.huge, math.huge, -math.huge, -math.huge }
+	if not accumulate(cf, size, b) or b[1] ~= b[1] or b[3] ~= b[3] then return nil end
+	return b[1], b[2], b[3], b[4]
+end
+
+local function bodyBox(char)
+	local b = { math.huge, math.huge, -math.huge, -math.huge }
+	local n = 0
+	for _, p in ipairs(char:GetChildren()) do
+		if p:IsA("BasePart") and p.Name ~= "HumanoidRootPart" then
+			if not accumulate(p.CFrame, p.Size, b) then return nil end
+			n += 1
+		end
+	end
+	if n == 0 or b[1] ~= b[1] or b[3] ~= b[3] then return nil end
+	return b[1], b[2], b[3], b[4]
+end
+
+local function isTeammate(plr)
+	return LP.Team ~= nil and plr.Team == LP.Team
+end
+
+local function getAimCenter()
+	local atCenter = Config.Aim.ForceCenter
+		or UIS.MouseBehavior == Enum.MouseBehavior.LockCenter
+		or not UIS.MouseEnabled
+	if atCenter then return Camera.ViewportSize / 2, true end
+	return UIS:GetMouseLocation(), false
+end
+
+-- Ballistic solver. Y is up. speed in studs/s, g = downward acceleration in studs/s^2 (0 = no drop).
+-- Returns a unit launch direction and time of flight, or nil if the target is out of range.
+local function solveShot(origin, tpos, tvel, speed, g)
+	local lead = Config.Ballistics.Lead
+	local t = (tpos - origin).Magnitude / speed
+	local dir
+	for _ = 1, 4 do
+		local aim = tpos + (lead and tvel or Vector3.zero) * t
+		local d = aim - origin
+		if d.Magnitude < 1e-3 then return nil end
+		local hv = Vector3.new(d.X, 0, d.Z)
+		local x, y = hv.Magnitude, d.Y
+		if g <= 0 or x < 1e-3 then
+			dir = d.Unit
+			t = d.Magnitude / speed
+		else
+			local s2 = speed * speed
+			local disc = s2 * s2 - g * (g * x * x + 2 * y * s2)
+			if disc < 0 then return nil end
+			local tanA = (s2 - math.sqrt(disc)) / (g * x)   -- low-angle solution
+			local cosA = 1 / math.sqrt(1 + tanA * tanA)
+			dir = (hv / x) * cosA + Vector3.yAxis * (tanA * cosA)
+			t = x / (speed * cosA)
+		end
+	end
+	if not dir or not isFinite3(dir) then return nil end
+	return dir, t
+end
+
+----------------------------------------------------------------- drawing objects
+local fovCircle
+if HAS_DRAWING then
+	fovCircle = newDraw("Circle", { Thickness = 1, NumSides = 64, Filled = false, Visible = false, Color = Config.Colors.FOV })
+end
+
+local function makeEntity()
+	local e = { corners = {}, bones = {}, lastVis = {}, visT = 0, all = {} }
+	local function reg(o) e.all[#e.all + 1] = o; return o end
+	for i = 1, 8 do e.corners[i] = reg(newDraw("Line", { Thickness = 1.5, Visible = false })) end
+	for i = 1, 14 do e.bones[i] = reg(newDraw("Line", { Thickness = 1, Visible = false })) end
+	e.Tracer = reg(newDraw("Line", { Thickness = 1, Visible = false }))
+	e.HeadDot = reg(newDraw("Circle", { Thickness = 1.5, NumSides = 16, Filled = false, Visible = false }))
+	e.Name = reg(newDraw("Text", { Size = 14, Center = true, Outline = true, Visible = false, Color = Config.Colors.Text }))
+	e.Info = reg(newDraw("Text", { Size = 12, Center = true, Outline = true, Visible = false, Color = Config.Colors.Text }))
+	e.HPBack = reg(newDraw("Square", { Thickness = 1, Filled = true, Visible = false, Color = Color3.new(0, 0, 0) }))
+	e.HP = reg(newDraw("Square", { Thickness = 1, Filled = true, Visible = false }))
+	return e
+end
+
+local function hideEntity(e)
+	for _, o in ipairs(e.all) do o.Visible = false end
+end
+
+local function removeEntity(plr)
+	local e = entities[plr]
+	if not e then return end
+	for _, o in ipairs(e.all) do pcall(function() o:Remove() end) end
+	entities[plr] = nil
+end
+
+local function setLine(l, a, b, col, vis)
+	l.Visible = vis
+	if vis then l.From, l.To, l.Color = a, b, col end
+end
+
+----------------------------------------------------------------- ESP + candidate collection
+local function seen(e, key, now)
+	local t = e.lastVis[key]
+	return t ~= nil and now - t <= 0.25
+end
+
+local function collect(now, camPos, center)
+	local cands = {}
+	local E, A = Config.ESP, Config.Aim
+	local aimRange = A.SyncESPRange and E.MaxDistance or A.MaxDistance
+	local vp = Camera.ViewportSize
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LP then
+			local e = entities[plr]
+			if not e then e = makeEntity(); entities[plr] = e end
+
+			local char = plr.Character
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			local root = char and (char:FindFirstChild("HumanoidRootPart") or char.PrimaryPart)
+
+			if not (char and hum and root) or hum.Health <= 0 or not isFinite3(root.Position) then
+				hideEntity(e)
+			else
+				local dist = (root.Position - camPos).Magnitude
+				local espOn = E.Enabled and dist <= E.MaxDistance and not (E.TeamCheck and isTeammate(plr))
+				local aimOn = A.Enabled and dist <= aimRange and not (A.TeamCheck and isTeammate(plr))
+
+				if not espOn and not aimOn then
+					hideEntity(e)
+				else
+					local parts = {}
+					for _, def in ipairs(PART_DEFS) do parts[def.key] = findPart(char, def.names) end
+
+					if now - e.visT >= 0.1 then
+						e.visT = now
+						local filter = { char }
+						if LP.Character then filter[2] = LP.Character end
+						for _, def in ipairs(PART_DEFS) do
+							local part = parts[def.key]
+							if part then
+								local sp = Camera:WorldToViewportPoint(part.Position)
+								if sp.Z > 0 and isPointVisible(camPos, part.Position, filter) then
+									e.lastVis[def.key] = now
+								end
+							end
+						end
+					end
+					local anyVisible = false
+					for _, def in ipairs(PART_DEFS) do
+						if seen(e, def.key, now) then anyVisible = true break end
+					end
+
+					-- ---- ESP drawing
+					local x1, y1, x2, y2
+					if espOn then x1, y1, x2, y2 = bodyBox(char) end
+					if espOn and x1 then
+						local col = anyVisible and Config.Colors.Visible or Config.Colors.Hidden
+						local w, h = x2 - x1, y2 - y1
+
+						if E.Corner then
+							local L = math.max(math.min(w, h) * 0.25, 3)
+							local c = e.corners
+							setLine(c[1], Vector2.new(x1, y1), Vector2.new(x1 + L, y1), col, true)
+							setLine(c[2], Vector2.new(x1, y1), Vector2.new(x1, y1 + L), col, true)
+							setLine(c[3], Vector2.new(x2, y1), Vector2.new(x2 - L, y1), col, true)
+							setLine(c[4], Vector2.new(x2, y1), Vector2.new(x2, y1 + L), col, true)
+							setLine(c[5], Vector2.new(x1, y2), Vector2.new(x1 + L, y2), col, true)
+							setLine(c[6], Vector2.new(x1, y2), Vector2.new(x1, y2 - L), col, true)
+							setLine(c[7], Vector2.new(x2, y2), Vector2.new(x2 - L, y2), col, true)
+							setLine(c[8], Vector2.new(x2, y2), Vector2.new(x2, y2 - L), col, true)
+						else
+							for i = 1, 8 do e.corners[i].Visible = false end
+						end
+
+						e.Name.Visible = E.Name
+						e.Name.Text = plr.DisplayName
+						e.Name.Position = Vector2.new((x1 + x2) / 2, y1 - 16)
+						e.Name.Color = col
+
+						local info = {}
+						if E.Health then table.insert(info, string.format("%d HP", math.floor(hum.Health))) end
+						if E.Distance then table.insert(info, string.format("%d st", math.floor(dist))) end
+						e.Info.Visible = #info > 0
+						e.Info.Text = table.concat(info, " | ")
+						e.Info.Position = Vector2.new((x1 + x2) / 2, y2 + 2)
+
+						local frac = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+						e.HPBack.Visible = E.Health
+						e.HPBack.Position = Vector2.new(x1 - 7, y1 - 1)
+						e.HPBack.Size = Vector2.new(4, h + 2)
+						e.HP.Visible = E.Health
+						e.HP.Position = Vector2.new(x1 - 6, y2 - h * frac)
+						e.HP.Size = Vector2.new(2, h * frac)
+						e.HP.Color = Color3.fromRGB(255 * (1 - frac), 255 * frac, 0)
+
+						if E.Skeleton then
+							local bones = char:FindFirstChild("UpperTorso") and BONES_R15 or BONES_R6
+							for i = 1, 14 do
+								local line, def = e.bones[i], bones[i]
+								local ok = false
+								if def then
+									local a, b = char:FindFirstChild(def[1]), char:FindFirstChild(def[2])
+									if a and b and a:IsA("BasePart") and b:IsA("BasePart") then
+										local pa = Camera:WorldToViewportPoint(a.Position)
+										local pb = Camera:WorldToViewportPoint(b.Position)
+										if pa.Z > 0 and pb.Z > 0 then
+											setLine(line, Vector2.new(pa.X, pa.Y), Vector2.new(pb.X, pb.Y), col, true)
+											ok = true
+										end
+									end
+								end
+								if not ok then line.Visible = false end
+							end
+						else
+							for i = 1, 14 do e.bones[i].Visible = false end
+						end
+
+						setLine(e.Tracer, Vector2.new(vp.X / 2, vp.Y), Vector2.new((x1 + x2) / 2, y2), col, E.Tracer)
+
+						local head = parts.Head
+						local hx1, hy1, hx2, hy2
+						if head and E.HeadDot then hx1, hy1, hx2, hy2 = projectBox(head.CFrame, head.Size) end
+						if hx1 then
+							e.HeadDot.Visible = true
+							e.HeadDot.Position = Vector2.new((hx1 + hx2) / 2, (hy1 + hy2) / 2)
+							e.HeadDot.Radius = math.max(2, math.max(hx2 - hx1, hy2 - hy1) / 2)
+							e.HeadDot.Color = seen(e, "Head", now) and Config.Colors.Visible or Config.Colors.Hidden
+						else
+							e.HeadDot.Visible = false
+						end
+					else
+						hideEntity(e)
+					end
+
+					-- ---- aimbot candidates (only what ESP range/team rules allow, optionally only visible)
+					if aimOn then
+						local keys = (A.Part == 7) and AIM_KEYS or { AIM_KEYS[A.Part] }
+						for _, k in ipairs(keys) do
+							local part = parts[k]
+							if part and (not A.VisibleOnly or seen(e, k, now)) then
+								local sp = Camera:WorldToViewportPoint(part.Position)
+								if sp.Z > 0 then
+									local d = (Vector2.new(sp.X, sp.Y) - center).Magnitude
+									if d <= A.FOV then
+										cands[#cands + 1] = { plr = plr, part = part, root = root, d = d }
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return cands
+end
+
+----------------------------------------------------------------- aimbot
+local function applyAim(cands, camPos, center, centerIsScreen)
+	local A, B = Config.Aim, Config.Ballistics
+	aimState = "kapali"
+	if not A.Enabled then lockedPlr = nil return end
+	if A.HoldRMB and not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+		aimState = "RMB bekliyor"; lockedPlr = nil; return
+	end
+	if #cands == 0 then aimState = "hedef yok"; lockedPlr = nil; return end
+
+	local pick
+	if A.Sticky and lockedPlr then
+		for _, c in ipairs(cands) do
+			if c.plr == lockedPlr and (not pick or c.d < pick.d) then pick = c end
+		end
+	end
+	if not pick then
+		for _, c in ipairs(cands) do if not pick or c.d < pick.d then pick = c end end
+	end
+	lockedPlr = pick.plr
+
+	local tpos = pick.part.Position
+	local dir
+	if B.Enabled and B.Speed ~= nil then
+		local vel = pick.root.AssemblyLinearVelocity
+		if not isFinite3(vel) or vel.Magnitude > 300 then vel = Vector3.zero end
+		local d, t = solveShot(camPos, tpos, vel, B.Speed, B.Drop or 0)
+		if not d then aimState = "menzil disi (balistik)"; return end
+		dir = d
+		aimState = string.format("kilit %s (ucus %.2fs)", pick.plr.Name, t)
+	else
+		dir = (tpos - camPos).Unit
+		aimState = "kilit " .. pick.plr.Name .. " (duz, balistik UNSET)"
+	end
+
+	local k = math.clamp(A.Smooth, 0.02, 1)
+	if centerIsScreen or not mousemoverel then
+		Camera.CFrame = Camera.CFrame:Lerp(CFrame.lookAt(camPos, camPos + dir), k)
+	else
+		local sp = Camera:WorldToViewportPoint(camPos + dir * (tpos - camPos).Magnitude)
+		if sp.Z > 0 then
+			local dv = (Vector2.new(sp.X, sp.Y) - center) * k
+			pcall(mousemoverel, dv.X, dv.Y)
+		end
+	end
+end
+
+----------------------------------------------------------------- less recoil
+-- Cancels a fraction of the camera's upward pitch change while firing. Uncalibrated;
+-- does nothing if the game applies recoil somewhere we do not see (e.g. overwrites the camera after us).
+local function pitchOf(cf)
+	return math.asin(math.clamp(cf.LookVector.Y, -1, 1))
+end
+
+local function applyRecoil()
+	if not (Config.Recoil.Enabled and firing and lastPitch) then return end
+	local delta = pitchOf(Camera.CFrame) - lastPitch
+	if delta > 0.0003 and delta < 0.2 then
+		Camera.CFrame = Camera.CFrame * CFrame.Angles(-delta * math.clamp(Config.Recoil.Strength, 0, 1), 0, 0)
+	end
+end
+
+----------------------------------------------------------------- main loop
+local function runSafe(name, fn, ...)
+	local ok, res = pcall(fn, ...)
+	if not ok then lastErr = name .. ": " .. tostring(res) return nil end
+	return res
+end
+
+local function onRender()
+	if unloaded then return end
+	Camera = Workspace.CurrentCamera
+	if not Camera or not HAS_DRAWING then return end
+	lastErr = "yok"
+	firing = toolFiring or mouseFiring
+
+	local now = os.clock()
+	local camPos = Camera.CFrame.Position
+	local center, centerIsScreen = getAimCenter()
+
+	fovCircle.Visible = Config.Aim.Enabled and Config.Aim.ShowFOV
+	fovCircle.Position = center
+	fovCircle.Radius = Config.Aim.FOV
+
+	local cands = runSafe("esp", collect, now, camPos, center) or {}
+	runSafe("recoil", applyRecoil)
+	runSafe("aim", applyAim, cands, camPos, center, centerIsScreen)
+	lastPitch = pitchOf(Camera.CFrame)
+
+	if statusLabel and statusLabel.Visible then
+		local B = Config.Ballistics
+		statusLabel.Text = string.format("aim: %s\nadaylar=%d ates=%s\nhiz=%s dusus=%s\nhata=%s\n%s",
+			aimState, #cands, tostring(firing),
+			B.Speed and tostring(B.Speed) or "UNSET", B.Drop and tostring(B.Drop) or "UNSET",
+			lastErr, table.concat(logLines, "\n"))
+	end
+end
+
+RunService:BindToRenderStep("FustRustMain", Enum.RenderPriority.Last.Value, onRender)
+table.insert(connections, Players.PlayerRemoving:Connect(removeEntity))
+
+----------------------------------------------------------------- firing detection + value scanning tools
+local function hookTool(tool)
+	table.insert(connections, tool.Activated:Connect(function() toolFiring = true end))
+	table.insert(connections, tool.Deactivated:Connect(function() toolFiring = false end))
+end
+local function watchCharacter(char)
+	for _, c in ipairs(char:GetChildren()) do if c:IsA("Tool") then hookTool(c) end end
+	table.insert(connections, char.ChildAdded:Connect(function(c) if c:IsA("Tool") then hookTool(c) end end))
+	table.insert(connections, char.ChildRemoved:Connect(function(c) if c:IsA("Tool") then toolFiring = false end end))
+end
+if LP.Character then watchCharacter(LP.Character) end
+table.insert(connections, LP.CharacterAdded:Connect(function(c) toolFiring = false; watchCharacter(c) end))
+
+table.insert(connections, UIS.InputBegan:Connect(function(i, gp)
+	if not gp and i.UserInputType == Enum.UserInputType.MouseButton1 then mouseFiring = true end
+end))
+table.insert(connections, UIS.InputEnded:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 then mouseFiring = false end
+end))
+
+local KEYWORDS = { "recoil", "bulletspeed", "muzzle", "velocity", "gravity", "drop", "projectile", "bullet", "speed", "spread" }
+local function matchKey(s)
+	s = s:lower()
+	for _, k in ipairs(KEYWORDS) do if s:find(k, 1, true) then return true end end
+	return false
+end
+
+local function scanValues()
+	local roots = { RS, LP:FindFirstChild("Backpack"), LP.Character, game:GetService("StarterPack") }
+	local n = 0
+	for _, root in ipairs(roots) do
+		if root then
+			for _, inst in ipairs(root:GetDescendants()) do
+				if matchKey(inst.Name) then
+					local v = inst:IsA("ValueBase") and (" = " .. tostring(inst.Value)) or ""
+					n += 1
+					log(inst:GetFullName() .. " [" .. inst.ClassName .. "]" .. v)
+				end
+				for k, val in pairs(inst:GetAttributes()) do
+					if matchKey(tostring(k)) then
+						n += 1
+						log(inst:GetFullName() .. " @" .. tostring(k) .. " = " .. tostring(val))
+					end
+				end
+				if n >= 80 then log("80 sonucta durdu") return end
+			end
+		end
+	end
+	log("scan bitti, bulunan: " .. n)
+end
+
+-- While ON and firing: logs new parts that appear near the camera with their physics speed
+-- and their measured movement speed (0 for both = hitscan or the game moves them another way).
+table.insert(connections, Workspace.DescendantAdded:Connect(function(inst)
+	if not measuring or not firing or not inst:IsA("BasePart") then return end
+	if (inst.Position - Camera.CFrame.Position).Magnitude > 25 then return end
+	task.delay(0.05, function()
+		if not inst.Parent then return end
+		local p1, v1 = inst.Position, inst.AssemblyLinearVelocity.Magnitude
+		task.delay(0.1, function()
+			if not inst.Parent then return end
+			log(string.format("mermi? %s fizik=%.0f hareket=%.0f st/s", inst.Name, v1, (inst.Position - p1).Magnitude / 0.1))
+		end)
+	end)
+end))
+
+----------------------------------------------------------------- menu (Rust style)
+local gui = Instance.new("ScreenGui")
+gui.Name = "FustRustMenu"; gui.ResetOnSpawn = false; gui.IgnoreGuiInset = true; gui.DisplayOrder = 999
+do
+	local ok, h = pcall(function() return gethui and gethui() end)
+	if ok and h then gui.Parent = h
+	else
+		local ok2 = pcall(function() gui.Parent = game:GetService("CoreGui") end)
+		if not ok2 or not gui.Parent then gui.Parent = LP:WaitForChild("PlayerGui") end
+	end
+end
+
+local BG = Color3.fromRGB(30, 28, 26)
+local PANEL = Color3.fromRGB(46, 43, 40)
+local EDGE = Color3.fromRGB(78, 72, 66)
+local RUST = Color3.fromRGB(205, 65, 43)
+local TEXT = Color3.fromRGB(222, 216, 205)
+local MUTED = Color3.fromRGB(150, 142, 132)
+local FONT = Enum.Font.RobotoCondensed
+
+local function stroke(p, col, th)
+	local s = Instance.new("UIStroke")
+	s.Color = col; s.Thickness = th or 1; s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Parent = p
+end
+
+local mark = Instance.new("TextLabel")
+mark.AnchorPoint = Vector2.new(0.5, 0)
+mark.Position = UDim2.new(0.5, 0, 0, 4)
+mark.Size = UDim2.fromOffset(300, 26)
+mark.BackgroundTransparency = 1
+mark.Text = "MODDED BY SYNCE"
+mark.Font = Enum.Font.GothamBlack
+mark.TextSize = 18
+mark.TextColor3 = RUST
+mark.Parent = gui
+do local s = Instance.new("UIStroke"); s.Thickness = 1.5; s.Color = Color3.new(0, 0, 0); s.Parent = mark end
+
+statusLabel = Instance.new("TextLabel")
+statusLabel.AnchorPoint = Vector2.new(1, 0)
+statusLabel.Position = UDim2.new(1, -8, 0, 36)
+statusLabel.Size = UDim2.fromOffset(300, 190)
+statusLabel.BackgroundColor3 = Color3.fromRGB(10, 10, 14)
+statusLabel.BackgroundTransparency = 0.35
+statusLabel.BorderSizePixel = 0
+statusLabel.TextColor3 = TEXT
+statusLabel.Font = Enum.Font.Code
+statusLabel.TextSize = 11
+statusLabel.TextWrapped = true
+statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+statusLabel.TextYAlignment = Enum.TextYAlignment.Top
+statusLabel.Text = "..."
+statusLabel.Parent = gui
+
+local window = Instance.new("Frame")
+window.Size = UDim2.fromOffset(290, 420)
+window.Position = UDim2.new(0, 20, 0.5, -210)
+window.BackgroundColor3 = BG
+window.BorderSizePixel = 0
+window.Parent = gui
+stroke(window, EDGE, 1)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 30)
+title.BackgroundColor3 = PANEL
+title.BorderSizePixel = 0
+title.Text = "   FUST SURVIVAL  //  SYNCE"
+title.TextColor3 = TEXT
+title.Font = FONT
+title.TextSize = 16
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = window
+do
+	local bar = Instance.new("Frame")
+	bar.Size = UDim2.new(0, 4, 1, 0)
+	bar.BackgroundColor3 = RUST
+	bar.BorderSizePixel = 0
+	bar.Parent = title
+end
+
+local tabBar = Instance.new("Frame")
+tabBar.Position = UDim2.fromOffset(0, 30)
+tabBar.Size = UDim2.new(1, 0, 0, 28)
+tabBar.BackgroundColor3 = BG
+tabBar.BorderSizePixel = 0
+tabBar.Parent = window
+
+local pages, tabButtons = {}, {}
+local function makePage()
+	local sf = Instance.new("ScrollingFrame")
+	sf.Position = UDim2.fromOffset(8, 64)
+	sf.Size = UDim2.new(1, -16, 1, -72)
+	sf.BackgroundTransparency = 1
+	sf.BorderSizePixel = 0
+	sf.ScrollBarThickness = 3
+	sf.ScrollBarImageColor3 = RUST
+	sf.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	sf.CanvasSize = UDim2.new()
+	sf.Visible = false
+	sf.Parent = window
+	local l = Instance.new("UIListLayout"); l.Padding = UDim.new(0, 5); l.Parent = sf
+	return sf
+end
+
+local function showTab(name)
+	for n, pg in pairs(pages) do pg.Visible = (n == name) end
+	for n, b in pairs(tabButtons) do
+		b.BackgroundColor3 = (n == name) and RUST or PANEL
+		b.TextColor3 = (n == name) and Color3.new(1, 1, 1) or MUTED
+	end
+end
+
+local function addTab(name, index, total)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1 / total, -6, 1, -4)
+	b.Position = UDim2.new((index - 1) / total, 4, 0, 2)
+	b.BackgroundColor3 = PANEL
+	b.BorderSizePixel = 0
+	b.AutoButtonColor = false
+	b.Font = FONT
+	b.TextSize = 15
+	b.Text = name
+	b.Parent = tabBar
+	stroke(b, EDGE, 1)
+	b.Activated:Connect(function() showTab(name) end)
+	tabButtons[name] = b
+	pages[name] = makePage()
+	return pages[name]
+end
+
+local espPage = addTab("ESP", 1, 4)
+local aimPage = addTab("AIM", 2, 4)
+local ballPage = addTab("BALL", 3, 4)
+local recoilPage = addTab("RECOIL", 4, 4)
+
+local function toggle(parent, text, tbl, key)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, 0, 0, 26)
+	b.BorderSizePixel = 0
+	b.AutoButtonColor = false
+	b.Font = FONT
+	b.TextSize = 15
+	b.TextXAlignment = Enum.TextXAlignment.Left
+	b.Parent = parent
+	stroke(b, EDGE, 1)
+	local function refresh()
+		b.Text = "  " .. text .. ":  " .. (tbl[key] and "ON" or "OFF")
+		b.BackgroundColor3 = tbl[key] and RUST or PANEL
+		b.TextColor3 = tbl[key] and Color3.new(1, 1, 1) or TEXT
+	end
+	refresh()
+	b.Activated:Connect(function() tbl[key] = not tbl[key]; refresh() end)
+end
+
+local function button(parent, text, fn)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(1, 0, 0, 26)
+	b.BackgroundColor3 = PANEL
+	b.BorderSizePixel = 0
+	b.AutoButtonColor = false
+	b.Font = FONT
+	b.TextSize = 15
+	b.TextColor3 = TEXT
+	b.Text = text
+	b.Parent = parent
+	stroke(b, RUST, 1)
+	b.Activated:Connect(fn)
+	return b
+end
+
+local function cycle(parent, text, tbl, key, names)
+	local b
+	local function refresh() b.Text = "  " .. text .. ":  < " .. names[tbl[key]] .. " >" end
+	b = button(parent, "", function() tbl[key] = tbl[key] % #names + 1; refresh() end)
+	b.TextXAlignment = Enum.TextXAlignment.Left
+	refresh()
+end
+
+local activeSlider
+-- A nil value is shown as UNSET (the bar stays empty until the user moves it).
+local function slider(parent, text, tbl, key, min, max, decimals)
+	local f = Instance.new("Frame")
+	f.Size = UDim2.new(1, 0, 0, 38)
+	f.BackgroundColor3 = PANEL
+	f.BorderSizePixel = 0
+	f.Parent = parent
+	stroke(f, EDGE, 1)
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(1, -10, 0, 18)
+	lbl.Position = UDim2.fromOffset(8, 1)
+	lbl.BackgroundTransparency = 1
+	lbl.Font = FONT
+	lbl.TextSize = 14
+	lbl.TextColor3 = TEXT
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.Parent = f
+	local bar = Instance.new("Frame")
+	bar.Position = UDim2.new(0, 8, 0, 25)
+	bar.Size = UDim2.new(1, -16, 0, 6)
+	bar.BackgroundColor3 = BG
+	bar.BorderSizePixel = 0
+	bar.Parent = f
+	local fill = Instance.new("Frame")
+	fill.BackgroundColor3 = RUST
+	fill.BorderSizePixel = 0
+	fill.Parent = bar
+	local mult = 10 ^ (decimals or 0)
+	local function set(v)
+		v = math.clamp(math.floor(v * mult + 0.5) / mult, min, max)
+		tbl[key] = v
+		fill.Size = UDim2.new((v - min) / (max - min), 0, 1, 0)
+		lbl.Text = text .. ": " .. tostring(v)
+	end
+	local function refresh()
+		if tbl[key] == nil then
+			fill.Size = UDim2.new(0, 0, 1, 0)
+			lbl.Text = text .. ": UNSET"
+		else
+			set(tbl[key])
+		end
+	end
+	refresh()
+	local function fromInput(x)
+		set(min + (max - min) * math.clamp((x - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1), 0, 1))
+	end
+	f.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			activeSlider = fromInput
+			fromInput(i.Position.X)
+		end
+	end)
+	return refresh
+end
+
+table.insert(connections, UIS.InputChanged:Connect(function(i)
+	if activeSlider and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+		activeSlider(i.Position.X)
+	end
+end))
+table.insert(connections, UIS.InputEnded:Connect(function(i)
+	if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+		activeSlider = nil
+	end
+end))
+
+-- ESP tab
+toggle(espPage, "ESP", Config.ESP, "Enabled")
+toggle(espPage, "Corner box", Config.ESP, "Corner")
+toggle(espPage, "Skeleton", Config.ESP, "Skeleton")
+toggle(espPage, "Head dot", Config.ESP, "HeadDot")
+toggle(espPage, "Tracer", Config.ESP, "Tracer")
+toggle(espPage, "Name", Config.ESP, "Name")
+toggle(espPage, "Health", Config.ESP, "Health")
+toggle(espPage, "Distance", Config.ESP, "Distance")
+toggle(espPage, "Team check", Config.ESP, "TeamCheck")
+slider(espPage, "ESP / view distance (studs)", Config.ESP, "MaxDistance", 50, 3000, 0)
+
+-- AIM tab
+toggle(aimPage, "Aimbot", Config.Aim, "Enabled")
+cycle(aimPage, "Target", Config.Aim, "Part", AIM_NAMES)
+toggle(aimPage, "Only visible targets", Config.Aim, "VisibleOnly")
+toggle(aimPage, "Sticky lock", Config.Aim, "Sticky")
+toggle(aimPage, "Range = ESP distance", Config.Aim, "SyncESPRange")
+toggle(aimPage, "Hold right click (PC)", Config.Aim, "HoldRMB")
+toggle(aimPage, "Force center crosshair", Config.Aim, "ForceCenter")
+toggle(aimPage, "FOV circle", Config.Aim, "ShowFOV")
+toggle(aimPage, "Team check", Config.Aim, "TeamCheck")
+slider(aimPage, "FOV (pixels)", Config.Aim, "FOV", 20, 600, 0)
+slider(aimPage, "Smoothing (1 = instant)", Config.Aim, "Smooth", 0.02, 1, 2)
+slider(aimPage, "Aim distance (when not synced)", Config.Aim, "MaxDistance", 50, 3000, 0)
+button(aimPage, "UNLOAD SCRIPT", function()
+	if getgenv and getgenv().__FUST_RUST_UNLOAD then getgenv().__FUST_RUST_UNLOAD() end
+end)
+
+-- BALL tab
+toggle(ballPage, "Ballistics", Config.Ballistics, "Enabled")
+toggle(ballPage, "Lead moving targets", Config.Ballistics, "Lead")
+local refreshSpeed = slider(ballPage, "Projectile speed (st/s)", Config.Ballistics, "Speed", 50, 5000, 0)
+local refreshDrop = slider(ballPage, "Drop / gravity (st/s2)", Config.Ballistics, "Drop", 0, 400, 1)
+button(ballPage, "Drop = workspace.Gravity", function()
+	Config.Ballistics.Drop = Workspace.Gravity
+	refreshDrop()
+	log("Drop = workspace.Gravity = " .. tostring(Workspace.Gravity))
+end)
+button(ballPage, "Reset speed + drop (UNSET)", function()
+	Config.Ballistics.Speed, Config.Ballistics.Drop = nil, nil
+	refreshSpeed(); refreshDrop()
+end)
+button(ballPage, "Scan values (speed/gravity/recoil)", scanValues)
+toggle(ballPage, "Measure projectiles while firing", { v = false }, "v")  -- replaced below
+ballPage:GetChildren()[#ballPage:GetChildren()]:Destroy()
+do
+	local b
+	local function refresh()
+		b.Text = "  Measure projectiles: " .. (measuring and "ON" or "OFF")
+		b.BackgroundColor3 = measuring and RUST or PANEL
+		b.TextColor3 = measuring and Color3.new(1, 1, 1) or TEXT
+	end
+	b = button(ballPage, "", function() measuring = not measuring; refresh() end)
+	b.TextXAlignment = Enum.TextXAlignment.Left
+	refresh()
+end
+
+-- RECOIL tab
+toggle(recoilPage, "Less recoil", Config.Recoil, "Enabled")
+slider(recoilPage, "Strength (0-1, uncalibrated)", Config.Recoil, "Strength", 0, 1, 2)
+button(recoilPage, "Scan values (speed/gravity/recoil)", scanValues)
+do
+	local b = button(recoilPage, "", function() statusLabel.Visible = not statusLabel.Visible end)
+	b.Text = "Toggle status panel"
+end
+
+if not HAS_DRAWING then
+	local w = Instance.new("TextLabel")
+	w.Size = UDim2.new(1, 0, 0, 18)
+	w.BackgroundTransparency = 1
+	w.Text = "WARNING: no Drawing API, ESP/aim won't run"
+	w.TextColor3 = Color3.fromRGB(255, 120, 100)
+	w.Font = FONT
+	w.TextSize = 14
+	w.Parent = espPage
+end
+
+showTab("ESP")
+
+-- dragging
+do
+	local dragging, startPos, startInput
+	title.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			dragging, startPos, startInput = true, window.Position, i.Position
+		end
+	end)
+	table.insert(connections, UIS.InputChanged:Connect(function(i)
+		if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - startInput
+			window.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+	table.insert(connections, UIS.InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+	end))
+end
+
+local orb = Instance.new("TextButton")
+orb.Size = UDim2.fromOffset(38, 38)
+orb.Position = UDim2.new(0, 8, 0, 8)
+orb.BackgroundColor3 = RUST
+orb.BorderSizePixel = 0
+orb.Text = "≡"
+orb.TextSize = 22
+orb.TextColor3 = Color3.new(1, 1, 1)
+orb.Font = Enum.Font.GothamBold
+orb.Parent = gui
+stroke(orb, Color3.fromRGB(0, 0, 0), 1)
+orb.Activated:Connect(function() window.Visible = not window.Visible end)
+table.insert(connections, UIS.InputBegan:Connect(function(i, gp)
+	if not gp and i.KeyCode == Enum.KeyCode.RightShift then window.Visible = not window.Visible end
+end))
+
+----------------------------------------------------------------- unload
+local function unload()
+	if unloaded then return end
+	unloaded = true
+	pcall(function() RunService:UnbindFromRenderStep("FustRustMain") end)
+	for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+	for plr in pairs(entities) do removeEntity(plr) end
+	if fovCircle then pcall(function() fovCircle:Remove() end) end
+	gui:Destroy()
+end
+if getgenv then getgenv().__FUST_RUST_UNLOAD = unload end
