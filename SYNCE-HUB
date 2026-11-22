@@ -1,0 +1,24 @@
+-- 1) top of the file
+local aimState, lastErr = "-", "none"
+
+-- 2) applyAim(): every aimState assignment
+aimState = "off"
+aimState = "waiting for RMB"; lockedPlr = nil; return
+if #cands == 0 then aimState = "no target"; lockedPlr = nil; return end
+if not d then aimState = "out of range (ballistic)"; return end
+aimState = string.format("locked %s (flight %.2fs)", pick.plr.Name, t)
+aimState = "locked " .. pick.plr.Name .. " (straight, ballistics UNSET)"
+
+-- 3) onRender()
+lastErr = "none"
+statusLabel.Text = string.format("aim: %s\ncandidates=%d firing=%s\nspeed=%s drop=%s\nerror=%s\n%s",
+	aimState, #cands, tostring(firing),
+	B.Speed and tostring(B.Speed) or "UNSET", B.Drop and tostring(B.Drop) or "UNSET",
+	lastErr, table.concat(logLines, "\n"))
+
+-- 4) scanValues()
+if n >= 80 then log("stopped at 80 results") return end
+log("scan done, found: " .. n)
+
+-- 5) projectile measurement
+log(string.format("projectile? %s physics=%.0f measured=%.0f st/s", inst.Name, v1, (inst.Position - p1).Magnitude / 0.1))
